@@ -61,6 +61,19 @@ const (
 	minFeasibleNodesPercentageToFind = 5
 )
 
+// nodeStatus is used to track filtering results for nodes during scheduling.
+type nodeStatus struct {
+	node   string
+	status *fwk.Status
+}
+
+// nodeStatusPool is a sync.Pool for nodeStatus objects to reduce GC pressure.
+var nodeStatusPool = sync.Pool{
+	New: func() interface{} {
+		return &nodeStatus{}
+	},
+}
+
 // ScheduleOne does the entire scheduling workflow for a single scheduling entity (either a pod or a pod group).
 // It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
@@ -124,6 +137,9 @@ func (sched *Scheduler) scheduleOnePod(ctx context.Context, podInfo *framework.Q
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
 	state := framework.NewCycleState()
+	// Ensure CycleState is returned to the pool after use
+	defer state.Recycle()
+
 	// For the sake of performance, scheduler does not measure and export the scheduler_plugin_execution_duration metric
 	// for every plugin execution in each scheduling cycle. Instead it samples a portion of scheduling cycles - percentage
 	// determined by pluginMetricsSamplePercent. The line below helps to randomly pick appropriate scheduling cycles.
@@ -794,11 +810,19 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(errors.New("findNodesThatPassFilters has completed"))
 
-	type nodeStatus struct {
-		node   string
-		status *fwk.Status
-	}
 	result := make([]*nodeStatus, numAllNodes)
+	// Defer cleanup to return objects to the pool
+	defer func() {
+		for _, ns := range result {
+			if ns != nil {
+				// Reset the fields before returning to pool
+				ns.node = ""
+				ns.status = nil
+				nodeStatusPool.Put(ns)
+			}
+		}
+	}()
+
 	checkNode := func(i int) {
 		// We check the nodes starting from where we left off in the previous scheduling cycle,
 		// this is to make sure all nodes have the same chance of being examined across pods.
@@ -819,7 +843,11 @@ func (sched *Scheduler) findNodesThatPassFilters(
 				feasibleNodes[length-1] = nodeInfo
 			}
 		} else {
-			result[i] = &nodeStatus{node: nodeInfo.Node().Name, status: status}
+			// Get a nodeStatus from the pool
+			ns := nodeStatusPool.Get().(*nodeStatus)
+			ns.node = nodeInfo.Node().Name
+			ns.status = status
+			result[i] = ns
 		}
 	}
 
